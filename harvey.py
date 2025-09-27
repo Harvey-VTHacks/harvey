@@ -244,12 +244,27 @@ CRITICAL SPOTLIGHT WORKFLOW:
 - NEVER click on Spotlight results - always use enter key
 - Example for opening Calculator: hotkey("cmd+space") → type_text("Calculator") → hotkey("enter")
 
+CRITICAL BROWSER WORKFLOW:
+- Step 1: If Safari/browser is open, use hotkey("cmd+t") to open a new tab
+- Step 2: The new tab automatically focuses the address bar
+- Step 3: Type your search term directly with type_text("search term")
+- Step 4: Press hotkey("enter") to search
+- NEVER use focus_address_bar() - use cmd+t instead
+- Example: hotkey("cmd+t") → type_text("cats") → hotkey("enter")
+
+GRID SYSTEM FOR PRECISE CLICKING:
+- The screenshot has a RED GRID OVERLAY with coordinate labels
+- Grid coordinates range from (0.0,0.0) to (1.0,1.0) 
+- Use the grid lines and labels to find exact click positions
+- Look for the grid coordinate labels like (0.2,0.3) near buttons/icons
+- Example: If a button is near the label (0.4,0.6), use left_click(0.4, 0.6)
+
 CLICKING ACCURACY RULES:
-- Be extremely precise with click coordinates 
-- Look carefully at button/icon centers in the screenshot
-- Use exact center positions like 0.52, 0.34 instead of round numbers
-- For small buttons, aim for the visual center, not edges
-- Double-check coordinate positions against what you see
+- Use the RED GRID LINES as your reference system
+- Find the closest grid intersection to your target
+- Read the coordinate labels (x.x,y.y) shown on the grid
+- Use those exact coordinates for clicking
+- Be precise: left_click(0.3, 0.7) based on grid labels
 
 CRITICAL: Check the screenshot first:
 - If Calculator app is visible → done()
@@ -257,11 +272,11 @@ CRITICAL: Check the screenshot first:
 - If the requested app/action is already complete → done()
 - Only continue if the task is NOT finished yet
 
-IMPORTANT: Use ratios from 0.0 to 1.0 for positions:
+GRID COORDINATE SYSTEM:
 - Top-left corner: (0.0, 0.0)
 - Center: (0.5, 0.5) 
 - Bottom-right: (1.0, 1.0)
-- Be precise: left_click(0.523, 0.347) not left_click(0.5, 0.3)
+- Use the visible grid labels for exact positioning
 
 Example response:
 See: Desktop with dock
@@ -311,7 +326,27 @@ Action: hotkey("cmd+space")"""
             return action if action else response_text.strip()
             
         except Exception as e:
+            error_str = str(e)
             print(f"LLM Error: {e}")
+            
+            # Handle rate limiting
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                print("⏳ Rate limit hit - waiting before retry...")
+                import re
+                # Extract retry delay if available
+                retry_match = re.search(r'Please retry in (\d+\.?\d*)s', error_str)
+                if retry_match:
+                    delay = float(retry_match.group(1))
+                    print(f"⏳ Waiting {delay:.1f} seconds...")
+                    time.sleep(delay + 1)  # Add 1 second buffer
+                else:
+                    time.sleep(10)  # Default 10 second wait
+                
+                # For browser workflows, provide smart fallback
+                if "safari" in task.lower() or "browser" in task.lower():
+                    if "search" in task.lower():
+                        return 'hotkey("cmd+t")'  # Open new tab for search
+                    
             return "done()"
     
     def execute(self, action_text):
