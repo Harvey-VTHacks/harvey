@@ -19,8 +19,8 @@ try:
 except ImportError:
     _QUARTZ_AVAILABLE = False
 
-def add_grid_overlay(image, grid_size=10):
-    """Add a coordinate grid overlay to the image for precise clicking."""
+def add_grid_overlay(image, grid_size=20):
+    """Add a high-precision coordinate grid overlay to the image for ultra-precise clicking."""
     from PIL import ImageDraw, ImageFont
     
     # Create a copy to draw on
@@ -29,47 +29,61 @@ def add_grid_overlay(image, grid_size=10):
     
     width, height = image.size
     
-    # Grid line color (semi-transparent red)
-    grid_color = (255, 0, 0, 128)  # Red with transparency
+    # Different line colors for major and minor grid lines
+    major_grid_color = (255, 0, 0, 180)  # Red for major lines
+    minor_grid_color = (255, 100, 100, 120)  # Light red for minor lines
     
     # Calculate grid spacing
     grid_width = width // grid_size
     grid_height = height // grid_size
     
-    # Draw vertical grid lines
+    # Draw minor grid lines (thinner, every line)
     for i in range(grid_size + 1):
         x = i * grid_width
-        draw.line([(x, 0), (x, height)], fill=grid_color, width=1)
+        line_width = 2 if i % 5 == 0 else 1  # Thicker every 5th line
+        color = major_grid_color if i % 5 == 0 else minor_grid_color
+        draw.line([(x, 0), (x, height)], fill=color, width=line_width)
     
-    # Draw horizontal grid lines  
     for i in range(grid_size + 1):
         y = i * grid_height
-        draw.line([(0, y), (width, y)], fill=grid_color, width=1)
+        line_width = 2 if i % 5 == 0 else 1  # Thicker every 5th line
+        color = major_grid_color if i % 5 == 0 else minor_grid_color
+        draw.line([(0, y), (width, y)], fill=color, width=line_width)
     
-    # Add coordinate labels at grid intersections
+    # Add coordinate labels with higher precision
     try:
-        # Try to use a system font, fallback to default if not available
-        font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 12)
+        font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 10)
     except:
         font = ImageFont.load_default()
     
-    # Add grid coordinate labels (every other line to avoid clutter)
-    for i in range(0, grid_size + 1, 2):
-        for j in range(0, grid_size + 1, 2):
+    # Add precise coordinate labels (every 5th line to avoid clutter)
+    for i in range(0, grid_size + 1, 5):
+        for j in range(0, grid_size + 1, 5):
             x = i * grid_width
             y = j * grid_height
             
-            # Convert to ratio coordinates (0.0 to 1.0)
-            ratio_x = round(i / grid_size, 1)
-            ratio_y = round(j / grid_size, 1)
+            # Convert to ratio coordinates with higher precision
+            ratio_x = round(i / grid_size, 2)  # 2 decimal places
+            ratio_y = round(j / grid_size, 2)
             
-            # Draw coordinate label
-            label = f"({ratio_x},{ratio_y})"
+            # Draw coordinate label with precise values
+            label = f"({ratio_x:.2f},{ratio_y:.2f})"
             
             # Add background rectangle for text readability
             bbox = draw.textbbox((x + 2, y + 2), label, font=font)
-            draw.rectangle(bbox, fill=(255, 255, 255, 200))  # White background
+            draw.rectangle(bbox, fill=(255, 255, 255, 220))  # White background
             draw.text((x + 2, y + 2), label, fill=(0, 0, 0), font=font)
+    
+    # Add crosshairs at center points for extra precision
+    crosshair_color = (0, 255, 0, 200)  # Green crosshairs
+    for i in range(1, grid_size, 2):  # Odd positions for center points
+        for j in range(1, grid_size, 2):
+            x = i * grid_width
+            y = j * grid_height
+            
+            # Draw small crosshair
+            draw.line([(x-3, y), (x+3, y)], fill=crosshair_color, width=2)
+            draw.line([(x, y-3), (x, y+3)], fill=crosshair_color, width=2)
     
     return img_with_grid
 
@@ -115,7 +129,7 @@ def capture_to_bytes(add_grid=True):
         
         # Add grid overlay for precise clicking
         if add_grid:
-            rgb_image = add_grid_overlay(rgb_image, grid_size=10)
+            rgb_image = add_grid_overlay(rgb_image, grid_size=20)
         
         # Convert to JPEG bytes
         img_byte_arr = io.BytesIO()

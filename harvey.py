@@ -13,26 +13,70 @@ sys.path.insert(0, str(Path(__file__).parent))
 from agent.screenshot import capture_to_bytes
 from agent.llm import get_gemini_client
 
+# Optional TTS support for spoken rationales
+_TTS_AVAILABLE = True
 try:
-    from Quartz import CGEventCreateMouseEvent, CGEventPost, kCGHIDEventTap, kCGEventLeftMouseDown, kCGEventLeftMouseUp, CGEventCreateKeyboardEvent, kCGEventKeyDown, kCGEventKeyUp, CGEventSetFlags, kCGEventFlagMaskCommand
+    # Import the speak helper from TTS_STT
+    from TTS_STT.speak import speak as tts_speak
+except Exception:
+    _TTS_AVAILABLE = False
+
+try:
+    from Quartz import CGEventCreateMouseEvent, CGEventPost, kCGHIDEventTap, kCGEventLeftMouseDown, kCGEventLeftMouseUp, CGEventCreateKeyboardEvent, kCGEventKeyDown, kCGEventKeyUp, CGEventSetFlags, kCGEventFlagMaskCommand, kCGEventMouseMoved
     from Quartz.CoreGraphics import CGMainDisplayID, CGDisplayBounds, CGEventCreate, CGEventGetLocation
     _QUARTZ_AVAILABLE = True
 except ImportError:
     _QUARTZ_AVAILABLE = False
 
-def get_screen_size():
+def get_screen_info():
+    """Get screen size in points and pixels to determine the exact scaling factor."""
     if _QUARTZ_AVAILABLE:
-        display = CGMainDisplayID()
-        bounds = CGDisplayBounds(display)
-        return int(bounds.size.width), int(bounds.size.height)
-    return 1920, 1080
+        from Quartz.CoreGraphics import (
+            CGMainDisplayID,
+            CGDisplayBounds,
+            CGDisplayCopyDisplayMode,
+            CGDisplayModeGetPixelWidth,
+            CGDisplayModeGetPixelHeight,
+        )
+
+        display_id = CGMainDisplayID()
+
+        # Logical dimensions (points)
+        bounds = CGDisplayBounds(display_id)
+        logical_width = int(bounds.size.width)
+        logical_height = int(bounds.size.height)
+
+        # Physical dimensions (pixels)
+        mode = CGDisplayCopyDisplayMode(display_id)
+        pixel_width = int(CGDisplayModeGetPixelWidth(mode)) if mode else logical_width
+        pixel_height = int(CGDisplayModeGetPixelHeight(mode)) if mode else logical_height
+
+        # Precise scale factor (e.g., 2.0 on Retina)
+        scale = (pixel_width / logical_width) if logical_width else 1.0
+
+        # Return logical size for event coordinates, plus scale for diagnostics
+        return logical_width, logical_height, scale
+    # Fallback for non-macOS systems
+    return 1920, 1080, 1.0
+
+def get_screen_size():
+    """Get screen size (for backward compatibility)."""
+    width, height, _ = get_screen_info()
+    return width, height
 
 def _transform_coords(x_ratio, y_ratio):
-    width, height = get_screen_size()
-    # Use round() instead of int() for better precision
-    x = round(x_ratio * width)
-    y = round(y_ratio * height)
-    print(f"📍 Ratio ({x_ratio:.3f}, {y_ratio:.3f}) -> Screen ({x}, {y}) [Screen: {width}x{height}]")
+    """Transform ratios (top-left origin) to Quartz screen coordinates (top-left origin)."""
+    width, height, scale = get_screen_info()
+
+    # Clamp ratios
+    x_ratio = max(0.0, min(1.0, float(x_ratio)))
+    y_ratio = max(0.0, min(1.0, float(y_ratio)))
+
+    # Convert to points (no Y flip; CGEvent global coords use top-left origin)
+    x = int(round(x_ratio * (width - 1)))
+    y = int(round(y_ratio * (height - 1)))
+
+    print(f"🎯 Ratio ({x_ratio:.3f}, {y_ratio:.3f}) -> Screen ({x}, {y}) [Points: {width}x{height}, Scale: {scale:.1f}x]")
     return x, y
 
 def get_current_mouse_position():
@@ -53,14 +97,14 @@ def smooth_move_mouse(start_x, start_y, end_x, end_y):
     for i in range(steps + 1):
         t = i / steps
         t_smooth = t * t * (3 - 2 * t)
-        
+
         control_x = (start_x + end_x) / 2 + (end_y - start_y) * 0.1
         control_y = (start_y + end_y) / 2 - (end_x - start_x) * 0.1
-        
-        x = int((1-t_smooth)**2 * start_x + 2*(1-t_smooth)*t_smooth * control_x + t_smooth**2 * end_x)
-        y = int((1-t_smooth)**2 * start_y + 2*(1-t_smooth)*t_smooth * control_y + t_smooth**2 * end_y)
-        
-        event = CGEventCreateMouseEvent(None, 5, (x, y), 0)
+
+        x = int((1 - t_smooth) ** 2 * start_x + 2 * (1 - t_smooth) * t_smooth * control_x + t_smooth ** 2 * end_x)
+        y = int((1 - t_smooth) ** 2 * start_y + 2 * (1 - t_smooth) * t_smooth * control_y + t_smooth ** 2 * end_y)
+
+        event = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (x, y), 0)
         CGEventPost(kCGHIDEventTap, event)
         time.sleep(0.01)
 
@@ -84,10 +128,90 @@ def _handle_spotlight_click(x_ratio, y_ratio):
     print("🔍 Spotlight: Using Enter to select first result (simplest path)")
     hotkey("return")
 
-def left_click(x_ratio, y_ratio):
+def calibrate_click_position(x, y):
+    """Apply optional calibration offsets via HARVEY_X_OFFSET and HARVEY_Y_OFFSET (points)."""
+    try:
+        offset_x = float(os.getenv("HARVEY_X_OFFSET", "0"))
+        offset_y = float(os.getenv("HARVEY_Y_OFFSET", "0"))
+    except Exception:
+        offset_x, offset_y = 0.0, 0.0
+    return int(x + offset_x), int(y + offset_y)
+
+def _write_env_offsets(offset_x: int, offset_y: int) -> bool:
+    """Create or update .env with HARVEY_X_OFFSET/Y_OFFSET values."""
+    try:
+        env_path = Path(".env")
+        lines = []
+        if env_path.exists():
+            lines = env_path.read_text().splitlines()
+
+        def set_or_replace(lines, key, value):
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith(f"{key}="):
+                    lines[i] = f"{key}={value}"
+                    found = True
+                    break
+            if not found:
+                lines.append(f"{key}={value}")
+            return lines
+
+        lines = set_or_replace(lines, "HARVEY_X_OFFSET", str(int(offset_x)))
+        lines = set_or_replace(lines, "HARVEY_Y_OFFSET", str(int(offset_y)))
+
+        # Ensure trailing newline
+        env_path.write_text("\n".join(lines) + "\n")
+        return True
+    except Exception as e:
+        print(f"❌ Could not write .env: {e}")
+        return False
+
+def calibrate_interactive():
+    """Interactive calibration: align to visual center and record offsets."""
+    if not _QUARTZ_AVAILABLE:
+        print("❌ Calibration requires macOS Quartz events.")
+        return
+
+    print("🧭 Calibration mode\n- We'll move the cursor to the computed screen center.\n- If it's not visually centered, manually move the cursor to the true center, then press Enter.\n- We'll compute offsets and optionally save them to .env.")
+
+    # Move to computed center
+    expected_x, expected_y = _transform_coords(0.5, 0.5)
+    cur_x, cur_y = get_current_mouse_position()
+    smooth_move_mouse(cur_x, cur_y, expected_x, expected_y)
+    print(f"🎯 Moved to computed center at ({expected_x}, {expected_y}).")
+
+    resp = input("Is the cursor exactly at the screen center? [y/N]: ").strip().lower()
+    if resp == "y":
+        print("✅ No offsets needed. If you previously set HARVEY_X_OFFSET/Y_OFFSET, you may remove them from .env.")
+        return
+
+    input("👉 Manually move the cursor to the true visual center, then press Enter to capture...")
+    final_x, final_y = get_current_mouse_position()
+    off_x = int(final_x - expected_x)
+    off_y = int(final_y - expected_y)
+
+    print(f"📐 Computed offsets: HARVEY_X_OFFSET={off_x}, HARVEY_Y_OFFSET={off_y}")
+
+    # Preview: apply offsets and re-center
+    preview_x = expected_x + off_x
+    preview_y = expected_y + off_y
+    cur_x, cur_y = get_current_mouse_position()
+    smooth_move_mouse(cur_x, cur_y, preview_x, preview_y)
+    print(f"👀 Preview applied at ({preview_x}, {preview_y}).")
+    confirm = input("Does this look perfectly centered now? Save to .env? [y/N]: ").strip().lower()
+    if confirm == "y":
+        if _write_env_offsets(off_x, off_y):
+            print("💾 Saved to .env. These offsets will be applied on the next run (dotenv loads on startup).")
+        else:
+            print("⚠️ Failed to write .env. Set these manually or rerun calibration.")
+    else:
+        print("📝 Offsets not saved. Re-run calibration if needed.")
+
+def ultra_precise_click(x_ratio, y_ratio):
+    """Ultra-precise click with position verification and calibration."""
     if not _QUARTZ_AVAILABLE:
         x, y = _transform_coords(x_ratio, y_ratio)
-        print(f"🖱️ Click at ({x}, {y}) (shown to user)")
+        print(f"🖱️ Click at ({x}, {y}) (simulated)")
         return
     
     if _is_spotlight_active():
@@ -95,20 +219,101 @@ def left_click(x_ratio, y_ratio):
         hotkey("return")
         return
     
+    # Transform and calibrate coordinates
     x, y = _transform_coords(x_ratio, y_ratio)
+    x, y = calibrate_click_position(x, y)
+    
+    print(f"🎯 Ultra-precise clicking at ({x}, {y})")
+    
+    # Move to position with higher precision
+    current_x, current_y = get_current_mouse_position()
+    smooth_move_mouse(current_x, current_y, x, y)
+    time.sleep(0.15)  # Slightly longer pause for precision
+    
+    # Verify we're at the right position and DON'T move again if close enough
+    final_x, final_y = get_current_mouse_position()
+    if abs(final_x - x) > 5 or abs(final_y - y) > 5:  # Increased tolerance
+        print(f"⚠️  Position drift detected: expected ({x}, {y}), got ({final_x}, {final_y})")
+        # Only correct if drift is significant
+        smooth_move_mouse(final_x, final_y, x, y)
+        time.sleep(0.05)  # Shorter wait
+    
+    # Get final position for click event
+    click_x, click_y = get_current_mouse_position()
+    
+    # Perform the click with error handling
+    try:
+        down_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (click_x, click_y), 0)
+        up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (click_x, click_y), 0)
+        
+        CGEventPost(kCGHIDEventTap, down_event)
+        time.sleep(0.05)
+        CGEventPost(kCGHIDEventTap, up_event)
+        
+        print(f"✅ Ultra-precise click completed at ({click_x}, {click_y})")
+    except Exception as e:
+        print(f"❌ Click failed: {e}")
+
+def precise_click(x_ratio, y_ratio):
+    """Main precise click function - uses ultra-precise system."""
+    ultra_precise_click(x_ratio, y_ratio)
+
+def left_click(x_ratio, y_ratio):
+    """Main click function - uses ultra-precise clicking system."""
+    ultra_precise_click(x_ratio, y_ratio)
+
+def double_click(x_ratio, y_ratio):
+    """Perform an ultra-precise double-click."""
+    if not _QUARTZ_AVAILABLE:
+        x, y = _transform_coords(x_ratio, y_ratio)
+        print(f"🖱️ Double-click at ({x}, {y}) (simulated)")
+        return
+    
+    # Transform and calibrate coordinates
+    x, y = _transform_coords(x_ratio, y_ratio)
+    x, y = calibrate_click_position(x, y)
+    
+    print(f"⚡ Ultra-precise double-clicking at ({x}, {y})")
+    
+    # Move to position with precision
     current_x, current_y = get_current_mouse_position()
     smooth_move_mouse(current_x, current_y, x, y)
     time.sleep(0.2)
     
+    # Verify position
+    final_x, final_y = get_current_mouse_position()
+    if abs(final_x - x) > 2 or abs(final_y - y) > 2:
+        print(f"⚠️  Position correction for double-click")
+        smooth_move_mouse(final_x, final_y, x, y)
+        time.sleep(0.1)
+    
+    # Perform double-click
     try:
-        down_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x, y), 0)
-        up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x, y), 0)
-        CGEventPost(kCGHIDEventTap, down_event)
-        time.sleep(0.05)
-        CGEventPost(kCGHIDEventTap, up_event)
-        print(f"✅ Clicked at ({x}, {y})")
+        for _ in range(2):
+            down_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x, y), 0)
+            up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x, y), 0)
+            CGEventPost(kCGHIDEventTap, down_event)
+            time.sleep(0.05)
+            CGEventPost(kCGHIDEventTap, up_event)
+            time.sleep(0.1)  # Brief pause between clicks
+        print(f"⚡ Ultra-precise double-click completed at ({x}, {y})")
     except Exception as e:
-        print(f"🖱️ Click at ({x}, {y}) (shown to user)")
+        print(f"❌ Double-click failed: {e}")
+
+def hover(x_ratio, y_ratio):
+    """Move mouse to position and hover (for tooltips, menus, etc.)."""
+    if not _QUARTZ_AVAILABLE:
+        x, y = _transform_coords(x_ratio, y_ratio)
+        print(f"👆 Hover at ({x}, {y}) (simulated)")
+        return
+    
+    x, y = _transform_coords(x_ratio, y_ratio)
+    print(f"👆 Hovering at ({x}, {y})")
+    
+    current_x, current_y = get_current_mouse_position()
+    smooth_move_mouse(current_x, current_y, x, y)
+    time.sleep(0.5)  # Hold position for hover effects
+    print(f"✅ Hover completed at ({x}, {y})")
 
 def type_text(text):
     if not _QUARTZ_AVAILABLE:
@@ -214,6 +419,7 @@ class Harvey:
     def __init__(self):
         self.client = get_gemini_client()
         self.model = "gemini-flash-latest"
+        self.last_see = ""
         
     def think(self, task, screenshot_data):
         prompt = f"""You are Harvey, a macOS automation assistant.
@@ -222,27 +428,46 @@ TASK: {task}
 
 Look at the current screen carefully. First, briefly describe what you see in 2-3 words (like "Desktop visible", "Arc browser open", "Spotlight search active").
 
-Then decide what to do next. If you can see that the task is already completed (e.g., Calculator app is open, Safari is running, etc.), respond with done().
+Then decide what to do next. 
 
 Format your response as:
 See: [brief description of what's on screen]
 Action: [your action]
 
 Actions available:
-- move_mouse(ratio_x, ratio_y) - move cursor using screen ratios (0.0 to 1.0)
-- left_click(ratio_x, ratio_y) - click using screen ratios (0.0 to 1.0)  
+- move_mouse(ratio_x, ratio_y) - move cursor using screen ratios (0.00 to 1.00)
+- left_click(ratio_x, ratio_y) - precise click using enhanced grid coordinates
+- double_click(ratio_x, ratio_y) - double-click for opening items
+- hover(ratio_x, ratio_y) - hover over element to reveal tooltips/menus
 - type_text("hello") - type text
 - hotkey("cmd+space") - press key combo
 - focus_address_bar() - focus browser address bar with cmd+l
 - wait(1000) - wait milliseconds
 - done() - task complete
 
+CRITICAL COMPLETION RULES:
+- NEVER call done() unless you have ACTUALLY COMPLETED every single step
+- For email tasks: done() ONLY after you have:
+  1. Clicked the Compose button
+  2. Clicked in the Subject field AND typed the subject text
+  3. Clicked in the Message body field AND typed the message content
+- If you see empty fields that need text, DO NOT call done()
+- If the task asks for specific text to be typed, you must TYPE IT
+- When in doubt, continue working - do not call done() prematurely
+
+EMAIL WORKFLOW - FOLLOW EXACTLY:
+- Step 1: Navigate to Gmail and click the Compose button
+- Step 2: Click in the Subject field (usually near top of compose dialog)
+- Step 3: Type the requested subject text with type_text()
+- Step 4: Click in the Message body field (larger text area below subject)
+- Step 5: Type the requested message content with type_text()
+- Step 6: ONLY then call done()
+
 CRITICAL SPOTLIGHT WORKFLOW:
 - Step 1: If desktop is visible, use hotkey("cmd+space") to open Spotlight
 - Step 2: If Spotlight is open (search bar visible), type the app name with type_text("App Name")
 - Step 3: After typing, press hotkey("enter") to launch the app
 - NEVER click on Spotlight results - always use enter key
-- Example for opening Calculator: hotkey("cmd+space") → type_text("Calculator") → hotkey("enter")
 
 CRITICAL BROWSER WORKFLOW:
 - Step 1: If Safari/browser is open, use hotkey("cmd+t") to open a new tab
@@ -250,27 +475,26 @@ CRITICAL BROWSER WORKFLOW:
 - Step 3: Type your search term directly with type_text("search term")
 - Step 4: Press hotkey("enter") to search
 - NEVER use focus_address_bar() - use cmd+t instead
-- Example: hotkey("cmd+t") → type_text("cats") → hotkey("enter")
 
-GRID SYSTEM FOR PRECISE CLICKING:
-- The screenshot has a RED GRID OVERLAY with coordinate labels
-- Grid coordinates range from (0.0,0.0) to (1.0,1.0) 
-- Use the grid lines and labels to find exact click positions
-- Look for the grid coordinate labels like (0.2,0.3) near buttons/icons
-- Example: If a button is near the label (0.4,0.6), use left_click(0.4, 0.6)
+ULTRA-PRECISE GRID SYSTEM FOR CLICKING:
+- The screenshot has a HIGH-RESOLUTION GRID OVERLAY (20x20 grid instead of 10x10)
+- RED major grid lines every 5th line, lighter red minor lines in between
+- GREEN crosshairs mark precise center points between grid lines
+- Grid coordinates range from (0.00,0.00) to (1.00,1.00) with 2 decimal precision
+- Look for coordinate labels like (0.25,0.35) for exact positioning
 
-CLICKING ACCURACY RULES:
-- Use the RED GRID LINES as your reference system
-- Find the closest grid intersection to your target
-- Read the coordinate labels (x.x,y.y) shown on the grid
-- Use those exact coordinates for clicking
-- Be precise: left_click(0.3, 0.7) based on grid labels
+ENHANCED CLICKING ACCURACY RULES:
+- Always aim for the VISUAL CENTER of the target element (button, icon, link).
+- Use the GREEN crosshairs as primary target points (they mark centers between grid lines).
+- If an element's center isn't on a crosshair, estimate position relative to lines using two decimals (e.g., left_click(0.47, 0.61)).
+- Prefer precise center clicks over edge clicks to avoid misses.
+- In your See: line, briefly name the target (e.g., "See: Subject field empty").
 
-CRITICAL: Check the screenshot first:
-- If Calculator app is visible → done()
-- If Safari is open → done() 
-- If the requested app/action is already complete → done()
-- Only continue if the task is NOT finished yet
+ELEMENT TARGETING STRATEGY:
+- Small buttons: Use exact grid coordinates where the button center aligns
+- Large buttons: Use center point with 2 decimal precision
+- Links/text: Click on the text center using precise grid positioning
+- Icons: Target the icon center using crosshair markers as guides
 
 GRID COORDINATE SYSTEM:
 - Top-left corner: (0.0, 0.0)
@@ -322,6 +546,8 @@ Action: hotkey("cmd+space")"""
             # Print what Harvey observes
             if see_line:
                 print(f"👁️  Harvey sees: {see_line}")
+            # Remember for rationale speech
+            self.last_see = see_line
             
             return action if action else response_text.strip()
             
@@ -352,6 +578,9 @@ Action: hotkey("cmd+space")"""
     def execute(self, action_text):
         print(f"🤖 Harvey: {action_text}")
         
+        # Add TTS before execution
+        self._speak_rationale(action_text, getattr(self, "last_see", ""), "")
+        
         try:
             if action_text.startswith("move_mouse"):
                 coords = self._extract_coords(action_text)
@@ -362,8 +591,20 @@ Action: hotkey("cmd+space")"""
             elif action_text.startswith("left_click"):
                 coords = self._extract_coords(action_text)
                 if coords:
-                    print(f"   → Clicking to select/activate")
+                    print(f"   → Precise clicking to select/activate")
                     left_click(coords[0], coords[1])
+                    
+            elif action_text.startswith("double_click"):
+                coords = self._extract_coords(action_text)
+                if coords:
+                    print(f"   → Double-clicking to open/activate")
+                    double_click(coords[0], coords[1])
+                    
+            elif action_text.startswith("hover"):
+                coords = self._extract_coords(action_text)
+                if coords:
+                    print(f"   → Hovering to reveal menu/tooltip")
+                    hover(coords[0], coords[1])
                     
             elif action_text.startswith("type_text"):
                 text = self._extract_text(action_text)
@@ -406,14 +647,91 @@ Action: hotkey("cmd+space")"""
             print(f"Action error: {e}")
             
         return False
+
+    def _speak_rationale(self, action_text: str, see_line: str, task: str):
+        """Speak what Harvey is going to do and what target it's aiming for."""
+        try:
+            if not _TTS_AVAILABLE:
+                return
+            if os.getenv("HARVEY_TTS", "1") in ("0", "false", "False"):
+                return
+            if not action_text:
+                return
+
+            action = action_text.strip()
+            reason = None
+
+            if action.startswith("hotkey"):
+                key = self._extract_text(action) or "shortcut"
+                if key == "cmd+space":
+                    reason = "Opening Spotlight."
+                elif key == "cmd+t":
+                    reason = "Opening new tab."
+                elif key in ("enter", "return"):
+                    reason = "Pressing Enter."
+                elif key == "cmd+l":
+                    reason = "Focusing address bar."
+                else:
+                    reason = f"Pressing {key}."
+            elif action.startswith("type_text"):
+                txt = self._extract_text(action) or "text"
+                if len(txt) > 20:
+                    txt = txt[:17] + "..."
+                reason = f"Typing {txt}."
+            elif action.startswith("left_click"):
+                coords = self._extract_coords(action)
+                # Extract specific target from see_line for better narration
+                if see_line:
+                    target_lower = see_line.lower()
+                    if "compose" in target_lower:
+                        reason = "Clicking compose button."
+                    elif "subject" in target_lower:
+                        reason = "Clicking subject field."
+                    elif "message" in target_lower or "body" in target_lower:
+                        reason = "Clicking message body."
+                    elif "button" in target_lower:
+                        reason = "Clicking button."
+                    elif "icon" in target_lower:
+                        reason = "Clicking icon."
+                    else:
+                        reason = f"Clicking target."
+                else:
+                    reason = "Clicking target."
+            elif action.startswith("double_click"):
+                reason = "Double-clicking to open."
+            elif action.startswith("hover"):
+                reason = "Hovering over element."
+            elif action.startswith("wait"):
+                ms = self._extract_number(action) or 1000
+                sec = ms / 1000
+                reason = f"Waiting {sec:.1f} seconds."
+            elif action.startswith("done"):
+                reason = "Task complete."
+
+            if reason:
+                # Generate audio file then play it via macOS afplay
+                audio_path = tts_speak(reason)
+                try:
+                    subprocess.run(["afplay", audio_path], check=False)
+                except Exception:
+                    pass
+        except Exception:
+            # Never let TTS errors break core automation
+            pass
     
     def _extract_coords(self, text):
-        """Extract (ratio_x, ratio_y) from action text"""
+        """Extract and validate (ratio_x, ratio_y) from action text."""
         import re
         match = re.search(r'\(([0-9.]+),\s*([0-9.]+)\)', text)
         if match:
             ratio_x = float(match.group(1))
             ratio_y = float(match.group(2))
+            
+            # Validate coordinates are within bounds
+            ratio_x = max(0.0, min(1.0, ratio_x))
+            ratio_y = max(0.0, min(1.0, ratio_y))
+            
+            print(f"🎯 Using coordinates: ({ratio_x:.3f}, {ratio_y:.3f})")
             return ratio_x, ratio_y
         return None
     
@@ -455,12 +773,26 @@ Action: hotkey("cmd+space")"""
                     print(f"🖼️  Image dimensions: {img.size[0]}x{img.size[1]} pixels")
                 except Exception as e:
                     print(f"❌ Error reading image: {e}")
+                # Also log screen points and scale for mapping verification
+                try:
+                    sw, sh, sc = get_screen_info()
+                    print(f"🖥️  Screen points: {sw}x{sh}, scale: {sc:.1f}x")
+                except Exception:
+                    pass
+                # Log screen info for diagnostics
+                try:
+                    sw, sh, sc = get_screen_info()
+                    print(f"🖥️  Screen points: {sw}x{sh}, scale: {sc:.1f}x")
+                except Exception:
+                    pass
             
             if not screenshot_data:
                 print("❌ Failed to capture screenshot")
                 break
                 
             action = self.think(task, screenshot_data)
+            # Speak a short rationale before executing the action
+            self._speak_rationale(action, getattr(self, "last_see", ""), task)
             done = self.execute(action)
             
             if done:
@@ -472,19 +804,25 @@ Action: hotkey("cmd+space")"""
         print("🏁 Harvey finished")
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python harvey.py \"your task here\"")
-        sys.exit(1)
-    
-    # Load environment variables first
+    # Load environment variables first (needed for offsets, API key)
     from dotenv import load_dotenv
     load_dotenv()
-    
+
+    # Simple CLI: either calibration or a single task string
+    if len(sys.argv) < 2:
+        print("Usage:\n  python harvey.py \"your task here\"\n  python harvey.py --calibrate    # interactive pointer calibration\n  python harvey.py calibrate      # same as --calibrate")
+        sys.exit(1)
+
+    arg1 = sys.argv[1].strip()
+    if arg1 in ("--calibrate", "calibrate"):
+        calibrate_interactive()
+        return
+
     if not os.getenv("GEMINI_API_KEY"):
         print("❌ Please set GEMINI_API_KEY in .env file")
         sys.exit(1)
-    
-    task = sys.argv[1]
+
+    task = arg1
     harvey = Harvey()
     harvey.run(task)
 
